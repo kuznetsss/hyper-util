@@ -6,6 +6,7 @@ use std::error::Error as StdError;
 use std::fmt::{self, Debug};
 use std::future::Future;
 use std::hash::Hash;
+use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
@@ -19,6 +20,8 @@ use tracing::{debug, trace};
 
 use hyper::rt::Sleep;
 use hyper::rt::Timer as _;
+
+use lru::LruCache;
 
 use crate::common::{exec, exec::Exec, timer::Timer};
 
@@ -83,7 +86,7 @@ struct PoolInner<T, K: Eq + Hash> {
     connecting: HashSet<K>,
     // These are internal Conns sitting in the event loop in the KeepAlive
     // state, waiting to receive a new Request to send on the socket.
-    idle: HashMap<K, Vec<Idle<T>>>,
+    idle: LruCache<K, Vec<Idle<T>>>,
     max_idle_per_host: usize,
     // These are outstanding Checkouts that are waiting for a socket to be
     // able to send a Request one. This is used when "racing" for a new
@@ -111,6 +114,7 @@ struct WeakOpt<T>(Option<Weak<T>>);
 pub struct Config {
     pub idle_timeout: Option<Duration>,
     pub max_idle_per_host: usize,
+    pub max_pool_size: NonZeroUsize
 }
 
 impl Config {
@@ -130,7 +134,7 @@ impl<T, K: Key> Pool<T, K> {
         let inner = if config.is_enabled() {
             Some(Arc::new(Mutex::new(PoolInner {
                 connecting: HashSet::new(),
-                idle: HashMap::new(),
+                idle: LruCache::new(config.max_pool_size),
                 idle_interval_ref: None,
                 max_idle_per_host: config.max_idle_per_host,
                 waiters: HashMap::new(),
@@ -342,7 +346,7 @@ impl<'a, T: Poolable + 'a, K: Debug> IdlePopper<'a, T, K> {
 
 impl<T: Poolable, K: Key> PoolInner<T, K> {
     fn put(&mut self, key: K, value: T, __pool_ref: &Arc<Mutex<PoolInner<T, K>>>) {
-        if value.can_share() && self.idle.contains_key(&key) {
+        if value.can_share() && self.idle.contains(&key) {
             trace!("put; existing idle HTTP/2 connection for {:?}", key);
             return;
         }
@@ -387,7 +391,7 @@ impl<T: Poolable, K: Key> PoolInner<T, K> {
             Some(value) => {
                 // borrow-check scope...
                 {
-                    let idle_list = self.idle.entry(key.clone()).or_default();
+                    let idle_list = self.idle.get_or_insert_mut(key.clone(), || Vec::<Idle<T>>::default());
                     if self.max_idle_per_host <= idle_list.len() {
                         trace!("max idle per host for {:?}, dropping connection", key);
                         return;
@@ -472,7 +476,8 @@ impl<T: Poolable, K: Key> PoolInner<T, K> {
         let now = Instant::now();
         //self.last_idle_check_at = now;
 
-        self.idle.retain(|key, values| {
+        let mut keys_to_remove = Vec::new();
+        self.idle.iter_mut().for_each(|(key, values)| {
             values.retain(|entry| {
                 if !entry.value.is_open() {
                     trace!("idle interval evicting closed for {:?}", key);
@@ -490,8 +495,12 @@ impl<T: Poolable, K: Key> PoolInner<T, K> {
             });
 
             // returning false evicts this key/val
-            !values.is_empty()
+            if values.is_empty() {
+                keys_to_remove.push(key.clone());
+            }
         });
+
+        keys_to_remove.iter().for_each(|k| { self.idle.pop(k); });
     }
 }
 
@@ -662,8 +671,7 @@ impl<T: Poolable, K: Key> Checkout<T, K> {
                 (None, true)
             };
             if empty {
-                //TODO: This could be done with the HashMap::entry API instead.
-                inner.idle.remove(&self.key);
+                inner.idle.pop(&self.key);
             }
 
             if entry.is_none() && self.waiter.is_none() {
@@ -834,6 +842,7 @@ mod tests {
     use std::fmt::Debug;
     use std::future::Future;
     use std::hash::Hash;
+    use std::num::NonZeroUsize;
     use std::pin::Pin;
     use std::task::{self, Poll};
     use std::time::Duration;
@@ -886,6 +895,7 @@ mod tests {
             super::Config {
                 idle_timeout: Some(Duration::from_millis(100)),
                 max_idle_per_host: max_idle,
+                max_pool_size: NonZeroUsize::new(::std::usize::MAX).unwrap(),
             },
             TokioExecutor::new(),
             Option::<timer::Timer>::None,
@@ -984,6 +994,7 @@ mod tests {
             super::Config {
                 idle_timeout: Some(Duration::from_millis(10)),
                 max_idle_per_host: std::usize::MAX,
+                max_pool_size: NonZeroUsize::new(::std::usize::MAX).unwrap(),
             },
             TokioExecutor::new(),
             Some(TokioTimer::new()),
@@ -1088,6 +1099,6 @@ mod tests {
             },
         );
 
-        assert!(!pool.locked().idle.contains_key(&key));
+        assert!(!pool.locked().idle.contains(&key));
     }
 }

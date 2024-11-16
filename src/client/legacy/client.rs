@@ -7,6 +7,7 @@
 use std::error::Error as StdError;
 use std::fmt;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::task::{self, Poll};
 use std::time::Duration;
@@ -1014,6 +1015,7 @@ impl Builder {
             pool_config: pool::Config {
                 idle_timeout: Some(Duration::from_secs(90)),
                 max_idle_per_host: usize::MAX,
+                max_pool_size: NonZeroUsize::new(100).unwrap(),
             },
             pool_timer: None,
         }
