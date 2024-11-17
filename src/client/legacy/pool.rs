@@ -110,11 +110,14 @@ struct PoolInner<T, K: Eq + Hash> {
 // doesn't need it!
 struct WeakOpt<T>(Option<Weak<T>>);
 
+// Option::unwrap() is not stable yet, so using usize here instead of NonZeroUsize
+pub const DEFAULT_POOL_SIZE: usize = 100;
+
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     pub idle_timeout: Option<Duration>,
     pub max_idle_per_host: usize,
-    pub max_pool_size: NonZeroUsize
+    pub max_pool_size: Option<NonZeroUsize>,
 }
 
 impl Config {
@@ -131,10 +134,16 @@ impl<T, K: Key> Pool<T, K> {
     {
         let exec = Exec::new(executor);
         let timer = timer.map(|t| Timer::new(t));
+
+        let idle = match config.max_pool_size {
+            Some(max_size) => LruCache::new(max_size),
+            None => LruCache::unbounded(),
+        };
+
         let inner = if config.is_enabled() {
             Some(Arc::new(Mutex::new(PoolInner {
                 connecting: HashSet::new(),
-                idle: LruCache::new(config.max_pool_size),
+                idle,
                 idle_interval_ref: None,
                 max_idle_per_host: config.max_idle_per_host,
                 waiters: HashMap::new(),
@@ -391,7 +400,9 @@ impl<T: Poolable, K: Key> PoolInner<T, K> {
             Some(value) => {
                 // borrow-check scope...
                 {
-                    let idle_list = self.idle.get_or_insert_mut(key.clone(), || Vec::<Idle<T>>::default());
+                    let idle_list = self
+                        .idle
+                        .get_or_insert_mut(key.clone(), Vec::<Idle<T>>::default);
                     if self.max_idle_per_host <= idle_list.len() {
                         trace!("max idle per host for {:?}, dropping connection", key);
                         return;
@@ -500,7 +511,9 @@ impl<T: Poolable, K: Key> PoolInner<T, K> {
             }
         });
 
-        keys_to_remove.iter().for_each(|k| { self.idle.pop(k); });
+        keys_to_remove.iter().for_each(|k| {
+            self.idle.pop(k);
+        });
     }
 }
 
@@ -887,15 +900,18 @@ mod tests {
     }
 
     fn pool_no_timer<T, K: Key>() -> Pool<T, K> {
-        pool_max_idle_no_timer(::std::usize::MAX)
+        pool_max_idle_no_timer(usize::MAX, None)
     }
 
-    fn pool_max_idle_no_timer<T, K: Key>(max_idle: usize) -> Pool<T, K> {
+    fn pool_max_idle_no_timer<T, K: Key>(
+        max_idle: usize,
+        pool_size: Option<NonZeroUsize>,
+    ) -> Pool<T, K> {
         let pool = Pool::new(
             super::Config {
                 idle_timeout: Some(Duration::from_millis(100)),
                 max_idle_per_host: max_idle,
-                max_pool_size: NonZeroUsize::new(::std::usize::MAX).unwrap(),
+                max_pool_size: pool_size,
             },
             TokioExecutor::new(),
             Option::<timer::Timer>::None,
@@ -974,7 +990,7 @@ mod tests {
 
     #[test]
     fn test_pool_max_idle_per_host() {
-        let pool = pool_max_idle_no_timer(2);
+        let pool = pool_max_idle_no_timer(2, None);
         let key = host_key("foo");
 
         pool.pooled(c(key.clone()), Uniq(41));
@@ -994,7 +1010,7 @@ mod tests {
             super::Config {
                 idle_timeout: Some(Duration::from_millis(10)),
                 max_idle_per_host: std::usize::MAX,
-                max_pool_size: NonZeroUsize::new(::std::usize::MAX).unwrap(),
+                max_pool_size: None,
             },
             TokioExecutor::new(),
             Some(TokioTimer::new()),
@@ -1017,6 +1033,22 @@ mod tests {
         tokio::task::yield_now().await;
 
         assert!(pool.locked().idle.get(&key).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pool_size_limit() {
+        let pool = pool_max_idle_no_timer(usize::MAX, Some(NonZeroUsize::new(2).unwrap()));
+        let key1 = host_key("foo");
+        let key2 = host_key("bar");
+        let key3 = host_key("baz");
+
+        pool.pooled(c(key1.clone()), Uniq(41));
+        pool.pooled(c(key2.clone()), Uniq(5));
+        pool.pooled(c(key3.clone()), Uniq(99));
+
+        assert!(pool.locked().idle.get(&key1).is_none());
+        assert!(pool.locked().idle.get(&key2).is_some());
+        assert!(pool.locked().idle.get(&key3).is_some());
     }
 
     #[tokio::test]

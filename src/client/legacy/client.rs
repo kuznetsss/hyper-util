@@ -1015,7 +1015,7 @@ impl Builder {
             pool_config: pool::Config {
                 idle_timeout: Some(Duration::from_secs(90)),
                 max_idle_per_host: usize::MAX,
-                max_pool_size: NonZeroUsize::new(100).unwrap(),
+                max_pool_size: Some(NonZeroUsize::new(pool::DEFAULT_POOL_SIZE).unwrap()),
             },
             pool_timer: None,
         }
